@@ -1,0 +1,161 @@
+name: Build Sabou APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_zip:
+        description: "Source ZIP in repository root (leave empty if Android project is committed directly)"
+        required: false
+        default: "Sabou-PreLint.zip"
+  push:
+    branches:
+      - main
+    paths:
+      - "**/*.kt"
+      - "**/*.kts"
+      - "**/*.xml"
+      - "gradle/**"
+      - "gradlew"
+      - "gradlew.bat"
+      - "*.zip"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-sabou-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    name: Compile, test and build Debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Resolve Android project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Case 1: Android project is committed directly in the repository.
+          if [[ -f "gradlew" && ( -f "settings.gradle.kts" || -f "settings.gradle" ) ]]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+          else
+            # Case 2: Android source is stored as a ZIP in the repository root.
+            INPUT_ZIP="${{ github.event.inputs.source_zip || '' }}"
+
+            if [[ -n "$INPUT_ZIP" && -f "$INPUT_ZIP" ]]; then
+              SOURCE_ZIP="$INPUT_ZIP"
+            elif [[ -f "Sabou-PreLint.zip" ]]; then
+              SOURCE_ZIP="Sabou-PreLint.zip"
+            else
+              SOURCE_ZIP="$(find . -maxdepth 1 -type f -name 'Sabou*.zip' -printf '%f\n' | sort -V | tail -n 1)"
+            fi
+
+            if [[ -z "${SOURCE_ZIP:-}" || ! -f "$SOURCE_ZIP" ]]; then
+              echo "ERROR: Android project or Sabou source ZIP was not found."
+              exit 1
+            fi
+
+            echo "Using source ZIP: $SOURCE_ZIP"
+            rm -rf "$RUNNER_TEMP/sabou-source"
+            mkdir -p "$RUNNER_TEMP/sabou-source"
+            unzip -q "$SOURCE_ZIP" -d "$RUNNER_TEMP/sabou-source"
+
+            PROJECT_DIR="$(find "$RUNNER_TEMP/sabou-source" -maxdepth 3 -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -printf '%h\n' | head -n 1)"
+
+            if [[ -z "$PROJECT_DIR" ]]; then
+              echo "ERROR: settings.gradle(.kts) was not found inside $SOURCE_ZIP"
+              exit 1
+            fi
+          fi
+
+          if [[ ! -f "$PROJECT_DIR/gradlew" ]]; then
+            echo "ERROR: gradlew was not found in $PROJECT_DIR"
+            exit 1
+          fi
+
+          chmod +x "$PROJECT_DIR/gradlew"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Android project: $PROJECT_DIR"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle and validate wrapper
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          validate-wrappers: true
+
+      - name: Compile Debug Kotlin
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$PROJECT_DIR"
+          ./gradlew --no-daemon --console=plain compileDebugKotlin --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/compileDebugKotlin.log"
+
+      - name: Run Debug Unit Tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$PROJECT_DIR"
+          ./gradlew --no-daemon --console=plain testDebugUnitTest --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/testDebugUnitTest.log"
+
+      - name: Assemble Debug APK
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$PROJECT_DIR"
+          ./gradlew --no-daemon --console=plain assembleDebug --stacktrace 2>&1 | tee "$GITHUB_WORKSPACE/assembleDebug.log"
+
+      - name: Stage APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+
+          mapfile -t APKS < <(find "$PROJECT_DIR" -type f -path '*/build/outputs/apk/debug/*.apk' | sort)
+
+          if [[ ${#APKS[@]} -eq 0 ]]; then
+            echo "ERROR: No Debug APK was produced."
+            exit 1
+          fi
+
+          for APK in "${APKS[@]}"; do
+            BASENAME="$(basename "$APK")"
+            cp "$APK" "$GITHUB_WORKSPACE/apk-output/$BASENAME"
+          done
+
+          cd "$GITHUB_WORKSPACE/apk-output"
+          sha256sum *.apk | tee SHA256SUMS.txt
+          ls -lh
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sabou-Debug-APK-${{ github.run_number }}
+          path: apk-output/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sabou-Build-Logs-${{ github.run_number }}
+          path: |
+            compileDebugKotlin.log
+            testDebugUnitTest.log
+            assembleDebug.log
+          if-no-files-found: ignore
+          retention-days: 14
